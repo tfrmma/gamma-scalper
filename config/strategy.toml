@@ -1,4 +1,4 @@
-# strategy.toml — quant params for the gamma scalp
+# strategy.toml - quant params for the gamma scalp
 # calibrated from vol_premium_btc_730d.parquet, don't touch without re-running the analysis
 
 [strategy]
@@ -32,29 +32,31 @@ base_notional_usd  = 5_000
 max_notional_usd   = 25_000
 min_notional_usd   = 500
 
-# Avellaneda-Stoikov — ref: A&S 2008
+# Avellaneda-Stoikov - ref: A&S 2008
 # gamma controls how hard we skew quotes vs inventory, k is arrival intensity sensitivity
 # TODO: run proper MLE calibration on Deribit order flow, these are reasonable starting points
 [avellaneda_stoikov]
 gamma                  = 0.1    # [0.01, 0.5] range, start conservative
 k                      = 1.5    # empirical fit, options book is thin
-T_hours_default        = 168.0  # fallback T — overridden at runtime by actual DTE
+T_hours_default        = 168.0  # fallback T - overridden at runtime by actual DTE
 spread_min_vol_pts     = 0.5
 spread_max_vol_pts     = 10.0
 skew_cap_vol_pts       = 3.0    # don't let inventory skew blow out the quote
 calibration_window_h   = 24
 calibration_min_trades = 50     # don't recalibrate on noise
 
-# close-to-close is fine for hourly data, upgrade to Yang-Zhang if we go sub-hourly
+# Yang-Zhang (2000) - ~5-8x more efficient than C2C on same bar count
 # primary_window=24h chosen from parquet analysis (best Sharpe/tail tradeoff)
+# estimator field kept for reference - YZ is always used when OHLC available,
+# C2C is the automatic fallback when only close ticks are present
 [realized_vol]
 primary_window_h    = 24
 secondary_window_h  = 168  # regime detection
-estimator           = "close_to_close"
+estimator           = "yang_zhang"
 annualization_factor = 8760  # 365*24, crypto never sleeps
 min_observations    = 12
 
-# entry at 5% — captures ~72% of opportunities, mean premium is 6.5%
+# entry at 5% - captures ~72% of opportunities, mean premium is 6.5%
 # emergency at -15% because corr(rv_24h, premium) = -0.928, when rv spikes we get hurt fast
 [vol_premium_signal]
 entry_threshold          = 0.05
@@ -63,13 +65,13 @@ emergency_exit_threshold = -0.15
 signal_smoothing_h       = 4
 
 # from parquet: funding mean_ann=5.27%, pct_positive=76.1%
-# Q1 bear funding: win_rate drops to 48% (coin flip), Q5 bull: 92% — size accordingly
+# Q1 bear funding: win_rate drops to 48% (coin flip), Q5 bull: 92% - size accordingly
 [funding_regime]
 bull_threshold          = 0.05   # >5% ann
 bear_threshold          = 0.00   # <0% ann, below this we're paying to hedge
 size_multiplier_bull    = 1.0
 size_multiplier_neutral = 0.7
-size_multiplier_bear    = 0.3    # still trade, just small — edge exists but barely
+size_multiplier_bear    = 0.3    # still trade, just small - edge exists but barely
 bear_confirmation_h     = 4      # don't react to a single 8h window, wait for confirmation
 
 # delta_threshold=0.05 gives ~99 hedges/year from simulation on actual returns
@@ -77,7 +79,7 @@ bear_confirmation_h     = 4      # don't react to a single 8h window, wait for c
 [delta_hedge]
 delta_threshold             = 0.05
 option_gamma_proxy          = 0.00002  # ATM approx, gets replaced by live greeks
-max_hedge_interval_h        = 8.0      # hard failsafe — hedge even if delta didn't move
+max_hedge_interval_h        = 8.0      # hard failsafe - hedge even if delta didn't move
 execution_style             = "aggressive_limit"
 aggressive_limit_timeout_ms = 500
 
