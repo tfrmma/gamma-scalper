@@ -422,49 +422,232 @@ class VolPremiumSignal:
         return len(self._raw_premiums)
 
 
-# ---- vol surface (thin wrapper) ---------------------------------------------
+# ---- SVI calibration --------------------------------------------------------
+
+def _norm_cdf(x: float) -> float:
+    """Abramowitz & Stegun. Same one used in deribit_gateway, keep in sync."""
+    if x < 0:
+        return 1.0 - _norm_cdf(-x)
+    t = 1.0 / (1.0 + 0.2316419 * x)
+    poly = t * (0.319381530
+              + t * (-0.356563782
+              + t * (1.781477937
+              + t * (-1.821255978
+              + t * 1.330274429))))
+    return 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * poly
+
+
+@dataclass
+class _SVIParams:
+    """
+    Raw SVI parametrization (Gatheral 2004).
+    w(k) = a + b*(rho*(k-m) + sqrt((k-m)^2 + sigma^2))
+    where k = log(K/F), w = implied_var * T
+    """
+    a:     float   # vertical shift (overall variance level)
+    b:     float   # slope (wing steepness, >= 0)
+    rho:   float   # correlation (-1 < rho < 1), controls skew
+    m:     float   # horizontal shift (ATM location)
+    sigma: float   # smoothness of ATM (> 0)
+
+    def w(self, k: float) -> float:
+        """Total variance at log-moneyness k."""
+        return self.a + self.b * (self.rho * (k - self.m)
+               + math.sqrt((k - self.m) ** 2 + self.sigma ** 2))
+
+    def iv(self, k: float, T: float) -> float:
+        """Annualized implied vol at log-moneyness k, time T (years)."""
+        if T <= 0:
+            return 0.0
+        w_val = self.w(k)
+        return math.sqrt(max(w_val, 0.0) / T)
+
+
+def _fit_svi(
+    strikes:  list[float],
+    ivs:      list[float],
+    forward:  float,
+    T:        float,
+) -> _SVIParams | None:
+    """
+    Fit SVI to a slice of (strike, IV) pairs using Levenberg-Marquardt via
+    scipy.optimize.least_squares. Returns None if fit fails or slice is too thin.
+
+    We don't need a perfect fit - just something better than nearest-strike.
+    If we have fewer than 3 points, not worth fitting; caller falls back to nearest.
+    """
+    if len(strikes) < 3 or T <= 0:
+        return None
+
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None   # scipy not available, caller falls back
+
+    ks  = [math.log(K / forward) for K in strikes]
+    ws  = [(iv ** 2) * T for iv in ivs]
+
+    def residuals(params: list) -> list:
+        a, b, rho, m, sigma = params
+        svi = _SVIParams(a, b, rho, m, sigma)
+        return [svi.w(k) - w for k, w in zip(ks, ws)]
+
+    # initial guess: flat vol surface
+    w_atm = float(np.mean(ws))
+    x0    = [w_atm, 0.1, -0.3, 0.0, 0.3]
+    bounds = (
+        [-np.inf, 0.0,  -0.999, -np.inf, 1e-4],
+        [ np.inf, np.inf, 0.999,  np.inf, np.inf],
+    )
+
+    try:
+        result = least_squares(residuals, x0, bounds=bounds, max_nfev=500, ftol=1e-6)
+        if not result.success and result.cost > 1e-3:
+            return None
+        a, b, rho, m, sigma = result.x
+        return _SVIParams(a=a, b=b, rho=rho, m=m, sigma=sigma)
+    except Exception:
+        return None
+
+
+# ---- vol surface ------------------------------------------------------------
 
 @dataclass
 class VolSurface:
     """
-    Holds the current IV surface from Deribit greeks snapshots.
-    Not doing SVI interpolation here - that's for the pricer.
-    This is just the state container.
+    SVI vol surface per expiry, calibrated from Deribit greeks snapshots.
 
-    TODO: add SVI fit so we can interpolate strikes that aren't quoted.
-    For now we only trade ATM straddles so it doesn't matter yet.
+    On each update_strike() call the raw grid gets a new point.
+    SVI is refitted when enough points are available (>= svi_min_strikes).
+    When SVI fit exists, iv_at_strike() interpolates/extrapolates smoothly.
+    When it doesn't (not enough strikes, fit failed), falls back to nearest-strike.
+
+    For straddles, only ATM matters - nearest-strike is fine.
+    For strangles, you need wings, and nearest-strike gives you stale/wrong IVs
+    for strikes that aren't directly quoted. That's what this solves.
     """
-    asset: str
+    asset:            str
+    svi_min_strikes:  int   = 4   # minimum strikes per expiry to attempt SVI fit
+    refit_interval_s: float = 60.0  # don't refit on every tick
 
-    # keyed by (expiry_ts, strike) -> iv
-    _iv_grid: dict[tuple[int, float], float] = field(init=False, default_factory=dict)
-    _last_update_ms: int = field(init=False, default=0)
+    _iv_grid:   dict[tuple[int, float], float] = field(init=False, default_factory=dict)
+    _svi_params: dict[int, _SVIParams]          = field(init=False, default_factory=dict)
+    _forwards:   dict[int, float]               = field(init=False, default_factory=dict)
+    _last_fit_s: dict[int, float]               = field(init=False, default_factory=dict)
+    _last_update_ms: int                        = field(init=False, default=0)
 
     def update_strike(self, expiry_ts: int, strike: float, iv: float) -> None:
         self._iv_grid[(expiry_ts, strike)] = iv
         self._last_update_ms = _now_ms()
+        self._maybe_refit(expiry_ts)
+
+    def update_forward(self, expiry_ts: int, forward: float) -> None:
+        """
+        Set the forward price for an expiry (index price is fine for short-dated).
+        Used by SVI calibration for log-moneyness calculation.
+        """
+        self._forwards[expiry_ts] = forward
+
+    def _maybe_refit(self, expiry_ts: int) -> None:
+        now = time.monotonic()
+        last = self._last_fit_s.get(expiry_ts, 0.0)
+        if now - last < self.refit_interval_s:
+            return
+
+        strikes_for_expiry = [k[1] for k in self._iv_grid if k[0] == expiry_ts]
+        if len(strikes_for_expiry) < self.svi_min_strikes:
+            return
+
+        ivs     = [self._iv_grid[(expiry_ts, s)] for s in strikes_for_expiry]
+        forward = self._forwards.get(expiry_ts, min(strikes_for_expiry))  # rough fallback
+        T       = max(0.0, (expiry_ts - time.time()) / (365 * 24 * 3600))
+
+        params = _fit_svi(strikes_for_expiry, ivs, forward, T)
+        if params is not None:
+            self._svi_params[expiry_ts] = params
+            log.debug(
+                f"SVI fit {self.asset} expiry={expiry_ts} "
+                f"a={params.a:.4f} b={params.b:.4f} rho={params.rho:.3f} "
+                f"m={params.m:.4f} sigma={params.sigma:.4f}"
+            )
+        self._last_fit_s[expiry_ts] = now
+
+    def iv_at_strike(self, expiry_ts: int, strike: float, forward: float) -> float:
+        """
+        IV at an arbitrary strike. Uses SVI if available, nearest-strike otherwise.
+        This is what strangle execution should call for wing strikes.
+        """
+        T = max(0.0, (expiry_ts - time.time()) / (365 * 24 * 3600))
+
+        params = self._svi_params.get(expiry_ts)
+        if params is not None and T > 0 and forward > 0:
+            k  = math.log(strike / forward)
+            iv = params.iv(k, T)
+            if iv > 0:
+                return iv
+
+        # fallback: nearest quoted strike
+        return self._nearest_strike_iv(expiry_ts, strike)
+
+    def _nearest_strike_iv(self, expiry_ts: int, strike: float) -> float:
+        candidates = {k: v for k, v in self._iv_grid.items() if k[0] == expiry_ts}
+        if not candidates:
+            raise StateError(f"{self.asset}: no IV data for expiry={expiry_ts}")
+        best = min(candidates, key=lambda k: abs(k[1] - strike))
+        return candidates[best]
+
+    def atm_iv(self, expiry_ts: int, spot: float) -> float:
+        """ATM IV - uses SVI if available, nearest-strike otherwise."""
+        return self.iv_at_strike(expiry_ts, spot, forward=spot)
 
     def get_iv(self, expiry_ts: int, strike: float) -> float:
+        """Exact lookup - raises if strike not in grid."""
         key = (expiry_ts, strike)
         if key not in self._iv_grid:
             raise StateError(f"{self.asset}: no IV for expiry={expiry_ts} strike={strike}")
         return self._iv_grid[key]
 
-    def atm_iv(self, expiry_ts: int, spot: float) -> float:
-        """Nearest-strike approximation for ATM IV. Good enough for straddles."""
-        candidates = {
-            k: v for k, v in self._iv_grid.items() if k[0] == expiry_ts
-        }
-        if not candidates:
-            raise StateError(f"{self.asset}: no IV data for expiry={expiry_ts}")
-        best = min(candidates, key=lambda k: abs(k[1] - spot))
-        return candidates[best]
+    def has_svi(self, expiry_ts: int) -> bool:
+        return expiry_ts in self._svi_params
+
+    def skew_at_delta(
+        self,
+        expiry_ts: int,
+        delta: float,
+        spot:  float,
+        is_call: bool = True,
+    ) -> float:
+        """
+        IV at a given delta target (e.g. 0.25 for 25-delta wing).
+        Inverts Black-76 numerically to find the strike, then queries the surface.
+        Needed for strangle entry when you size by delta rather than moneyness.
+        """
+        T = max(1e-6, (expiry_ts - time.time()) / (365 * 24 * 3600))
+
+        # bracket search: find strike where Black-76 delta matches target
+        # works for calls (delta > 0) and puts (delta < 0, pass abs value)
+        abs_delta = abs(delta)
+        lo, hi    = spot * 0.5, spot * 2.0
+
+        for _ in range(50):
+            mid    = (lo + hi) / 2.0
+            iv_mid = self.iv_at_strike(expiry_ts, mid, spot)
+            d1     = (math.log(spot / mid) + 0.5 * iv_mid**2 * T) / (iv_mid * math.sqrt(T) + 1e-10)
+            d_mid  = _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+
+            if abs(abs(d_mid) - abs_delta) < 1e-5:
+                break
+            if abs(d_mid) > abs_delta:
+                hi = mid  # too far ITM
+            else:
+                lo = mid  # too far OTM
+
+        return self.iv_at_strike(expiry_ts, mid, spot)
 
     def is_stale(self, threshold_ms: int) -> bool:
         return (_now_ms() - self._last_update_ms) > threshold_ms
 
     def expiries(self) -> set[int]:
-        """All expiry timestamps currently in the surface."""
         return {k[0] for k in self._iv_grid}
 
     @property
@@ -667,7 +850,9 @@ class StateEngine:
 
         try:
             spot = self.index.price()
-            rv   = self.rv_estimator.rv_primary()
+            # keep forward updated for SVI calibration
+            self.vol_surface.update_forward(expiry_ts, spot)
+            rv = self.rv_estimator.rv_primary()
             self.vol_premium.update(iv, rv)
         except StateError:
             pass  # not ready yet, skip signal update
@@ -695,6 +880,19 @@ class StateEngine:
 
     def atm_iv(self, expiry_ts: int) -> float:
         return self.vol_surface.atm_iv(expiry_ts, self.index.price())
+
+    def iv_at_strike(self, expiry_ts: int, strike: float) -> float:
+        """SVI-interpolated IV at arbitrary strike. Falls back to nearest-quoted."""
+        return self.vol_surface.iv_at_strike(expiry_ts, strike, self.index.price())
+
+    def skew_at_delta(self, expiry_ts: int, delta: float, is_call: bool = True) -> float:
+        """IV for a delta-targeted wing (e.g. 0.25 for 25d strangle leg)."""
+        return self.vol_surface.skew_at_delta(
+            expiry_ts, delta, self.index.price(), is_call
+        )
+
+    def has_svi(self, expiry_ts: int) -> bool:
+        return self.vol_surface.has_svi(expiry_ts)
 
     def needs_hedge(self) -> bool:
         return self.delta_tracker.needs_hedge()
