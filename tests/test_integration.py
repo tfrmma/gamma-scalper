@@ -228,8 +228,10 @@ async def test_risk_rv_spike_halts():
 
     risk._on_halt = on_halt
 
-    # inject a 30% hourly return — rv_ratio will be >> 3x
-    state.rv_estimator._returns.append(0.30)
+    # inject a 30% hourly candle - rv_ratio will be >> 3x
+    state.rv_estimator.update_ohlc(
+        o=price, h=price * 1.30, l=price * 0.98, c=price * 1.28,
+    )
 
     await risk._run_checks()
 
