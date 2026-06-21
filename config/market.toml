@@ -1,0 +1,63 @@
+# market.toml — venue constants, fees, book validation
+# if you're changing anything here mid-session you're already having a bad day
+
+[venue]
+name             = "deribit"
+options_ws_url   = "wss://www.deribit.com/ws/api/v2"
+rest_url         = "https://www.deribit.com/api/v2"
+testnet_ws_url   = "wss://test.deribit.com/ws/api/v2"
+testnet_rest_url = "https://test.deribit.com/api/v2"
+use_testnet      = true  # flip before you do something stupid
+
+[venue.rate_limits]
+max_requests_per_second     = 20   # WS burst limit per Deribit docs
+max_orders_per_second       = 5    # private channel, conservative
+websocket_reconnect_delay_s = 2.0
+heartbeat_interval_s        = 10.0
+
+# add [assets.ETH] below when going multi-leg
+[assets.BTC]
+currency              = "BTC"
+option_kind           = "european"
+perp_instrument       = "BTC-PERPETUAL"
+index_instrument      = "btc_usd"
+tick_size_perp        = 0.5    # USD per tick
+min_trade_amount_perp = 10.0   # USD notional minimum
+contract_size         = 10.0   # USD per options contract
+funding_interval_h    = 8
+dvol_index            = "DVOL"
+
+[assets.ETH]
+currency              = "ETH"
+option_kind           = "european"
+perp_instrument       = "ETH-PERPETUAL"
+index_instrument      = "eth_usd"
+tick_size_perp        = 0.05
+min_trade_amount_perp = 1.0
+contract_size         = 1.0
+funding_interval_h    = 8
+dvol_index            = "ETHVOL"
+
+# update these when your tier changes, Deribit reprices occasionally
+[fees.BTC]
+option_maker_rebate = -0.0001   # yes, they pay you
+option_taker_fee    = 0.0003
+option_delivery_fee = 0.00015
+perp_maker_fee      = -0.00010
+perp_taker_fee      = 0.00050
+settlement_fee      = 0.00015
+
+[fees.ETH]
+option_maker_rebate = -0.0001
+option_taker_fee    = 0.0003
+option_delivery_fee = 0.00015
+perp_maker_fee      = -0.00010
+perp_taker_fee      = 0.00050
+settlement_fee      = 0.00015
+
+[orderbook]
+max_spread_pct          = 0.10   # wider than this and the book is broken
+min_bid_levels          = 3
+min_ask_levels          = 3
+stale_book_threshold_ms = 2000
+sequence_gap_action     = "resync"  # "resync" | "halt"

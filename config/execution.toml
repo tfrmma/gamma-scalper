@@ -1,0 +1,40 @@
+# execution.toml — how we actually touch the market
+
+[options_execution]
+order_type                = "limit"          # never market on options, ever
+post_only                 = true             # mandatory — taker fees kill the edge
+price_improvement_vol_pts = 0.5             # give up half a vol pt to get filled
+cancel_on_iv_drift_vol_pts = 1.0            # IV moved on us, requote
+cancel_on_index_move_pct  = 0.005           # 50bps move = stale quote
+cancel_on_time_ms         = 30_000          # 30s max lifetime regardless
+min_fill_size_pct         = 0.50            # don't bother with tiny partials
+self_trade_prevention     = "cancel_newest"
+max_order_retries         = 3
+retry_delay_ms            = 200
+
+[perp_execution]
+order_type             = "aggressive_limit"  # post at best, convert to market if stale
+limit_offset_ticks     = 1
+convert_to_market_ms   = 500
+max_slippage_ticks     = 3
+max_slippage_pct       = 0.001
+round_to_contract_size = true
+emergency_order_type   = "market"           # kill switch path — get flat, worry about cost later
+emergency_max_retries  = 5
+
+[latency]
+target_market_data_lag_ms  = 50
+target_signal_compute_ms   = 10
+target_order_send_ms       = 100
+target_hedge_roundtrip_ms  = 300
+hard_limit_order_send_ms   = 2_000
+hard_limit_hedge_ms        = 5_000
+measurement_window_s       = 60
+alert_percentile           = 95   # P95, not mean — don't let outliers hide
+
+[footprint]
+spread_across_levels = false     # overkill at current size, revisit above $500k notional
+max_visible_size_pct = 0.30
+timing_jitter_ms     = 100       # ±100ms, good enough to not be obvious
+size_jitter_pct      = 0.05
+use_iceberg          = false     # Deribit doesn't support it on options anyway

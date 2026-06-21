@@ -1,0 +1,79 @@
+# risk.toml — the thing that saves your account
+# risk engine has veto on everything, strategy layer is read-only here
+
+# sized so a 1pct premium event (pct1=-37.7% from parquet) = survivable drawdown
+# system needs to handle 433h consecutive negative edge (seen in data, ~18 days)
+[position_limits.BTC]
+max_vega_usd           = 5_000
+max_gamma_usd          = 2_000
+max_theta_usd_per_day  = 500    # positive = earning theta, this is the ceiling
+max_delta_btc          = 0.50
+max_delta_notional_usd = 30_000
+max_open_notional_usd  = 50_000
+max_perp_notional_usd  = 60_000
+
+[position_limits.ETH]
+max_vega_usd           = 2_000
+max_gamma_usd          = 1_000
+max_theta_usd_per_day  = 200
+max_delta_eth          = 2.0
+max_delta_notional_usd = 10_000
+max_open_notional_usd  = 20_000
+max_perp_notional_usd  = 25_000
+
+[position_limits.aggregate]
+max_total_notional_usd = 100_000
+max_total_vega_usd     = 8_000
+max_margin_utilization = 0.70   # never go above 70%, Deribit margin calls are not fun
+
+# P95 consecutive negative edge = 156h, size to survive the full 18d drawdown period
+[drawdown]
+max_intraday_drawdown_usd = 2_000
+max_intraday_drawdown_pct = 0.05
+max_drawdown_24h_usd      = 3_000
+max_drawdown_7d_usd       = 8_000
+max_drawdown_30d_usd      = 20_000
+recovery_threshold_usd    = 500  # need to earn this back before resuming
+recovery_wait_h           = 4
+
+# any single trigger fires a full flatten + halt — no partial actions
+[kill_switch]
+# API health
+api_error_consecutive      = 3
+api_latency_threshold_ms   = 1000
+api_latency_consecutive    = 5
+websocket_disconnect_max_s = 10
+
+# book integrity
+orderbook_stale_max_s  = 5
+index_divergence_pct   = 0.05  # perp vs index, if this blows out something is very wrong
+sequence_gap_max       = 3
+
+# corr(rv_24h, vol_premium_24h) = -0.928 — when RV spikes, edge is gone, get flat
+rv_spike_threshold      = 1.50  # RV(1h)/RV(24h) > 1.5x: reduce
+rv_spike_halt_threshold = 3.00  # > 3x: halt immediately
+
+# at -20% ann, short perp costs 0.44% per 8h window — eats the entire premium
+funding_negative_halt_ann = -0.20
+
+# premium signal deterioration
+premium_negative_consecutive_h = 48  # 2 days negative: cut to 30%
+premium_emergency_h            = 8   # emergency_exit_threshold for 8h: flatten
+
+# loss velocity — something is badly wrong if we're losing this fast
+max_loss_per_hour_usd   = 500
+max_loss_per_minute_usd = 100
+
+[margin]
+min_margin_buffer_pct       = 0.30
+margin_warning_pct          = 0.50
+margin_reduce_pct           = 0.65
+margin_halt_pct             = 0.80  # no new orders above this
+emergency_reduce_step_pct   = 0.25  # delever 25% at a time
+emergency_reduce_interval_s = 30
+
+# TODO: tighten component_dominance_threshold once we have a few weeks of live attribution
+[pnl_attribution]
+min_confidence_pct            = 0.80
+recompute_interval_s          = 60
+component_dominance_threshold = 0.90  # if one Greek is >90% of PnL, model is probably broken
