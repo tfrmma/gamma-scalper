@@ -122,37 +122,118 @@ class OrderBook:
 
 # ---- RV estimator -----------------------------------------------------------
 
+class _Bar(NamedTuple):
+    o: float   # open
+    h: float   # high
+    l: float   # low
+    c: float   # close
+
+
 @dataclass
 class RealizedVolEstimator:
     """
-    Rolling close-to-close RV. Simple and it works.
-    Yang-Zhang would be better on sub-hourly data but we're on hourly ticks.
-    If we ever go to minute bars, revisit.
+    Yang-Zhang (2000) volatility estimator.
+
+    Combines overnight (close-to-open), open-to-close, and Rogers-Satchell
+    components into a single minimum-variance estimator. Roughly 5-8x more
+    efficient than close-to-close on the same number of bars - matters a lot
+    when your primary window is only 24 bars.
+
+    YZ formula:
+        sigma^2 = sigma_o^2 + k * sigma_c^2 + (1-k) * sigma_rs^2
+
+    where:
+        sigma_o  = overnight vol (log(open_t / close_{t-1}))
+        sigma_c  = open-to-close vol (log(close_t / open_t))
+        sigma_rs = Rogers-Satchell: E[log(H/C)*log(H/O) + log(L/C)*log(L/O)]
+        k        = 0.34 / (1.34 + (n+1)/(n-1))  - optimal weighting
+
+    Falls back to close-to-close if OHLC is not available (e.g. during warmup
+    when we only have tick closes from the index feed). Caller sets has_ohlc.
     """
-    primary_window:    int    # hours
-    secondary_window:  int    # hours, for regime detection
-    annualization:     int    # 8760 for hourly crypto
+    primary_window:    int
+    secondary_window:  int
+    annualization:     int
     min_obs:           int
 
-    _returns: deque = field(init=False)
+    _bars:     deque = field(init=False)
+    _last_bar: _Bar | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        # secondary window is always larger, allocate for it
-        self._returns  = deque(maxlen=self.secondary_window)
-        self._last_px  = None
+        self._bars = deque(maxlen=self.secondary_window)
 
-    def update(self, price: float) -> None:
-        if self._last_px is not None and self._last_px > 0:
-            ret = math.log(price / self._last_px)
-            self._returns.append(ret)
-        self._last_px = price
+    def update(self, close: float) -> None:
+        """Close-only update - open=high=low=close. Used when full OHLC not available."""
+        self._update_bar(_Bar(o=close, h=close, l=close, c=close))
+
+    def update_ohlc(self, o: float, h: float, l: float, c: float) -> None:
+        """Full bar update. Use this when you have real OHLC from the feed."""
+        if not (l <= o <= h and l <= c <= h):
+            # bad tick - clamp rather than reject, don't want gaps
+            h = max(o, h, l, c)
+            l = min(o, h, l, c)
+        self._update_bar(_Bar(o=o, h=h, l=l, c=c))
+
+    def _update_bar(self, bar: _Bar) -> None:
+        self._bars.append(bar)
+        self._last_bar = bar
 
     def rv(self, window: int | None = None) -> float:
-        w   = window or self.primary_window
-        obs = list(self._returns)[-w:]
-        if len(obs) < self.min_obs:
-            raise StateError(f"RV needs {self.min_obs} obs, have {len(obs)}")
-        return float(np.std(obs, ddof=1) * math.sqrt(self.annualization))
+        w    = window or self.primary_window
+        bars = list(self._bars)[-w:]
+        if len(bars) < self.min_obs:
+            raise StateError(f"RV needs {self.min_obs} obs, have {len(bars)}")
+
+        # check if we have real OHLC or just close ticks
+        has_ohlc = any(b.h != b.l for b in bars)
+        if has_ohlc:
+            return self._yang_zhang(bars)
+        return self._close_to_close(bars)
+
+    def _yang_zhang(self, bars: list[_Bar]) -> float:
+        n = len(bars)
+        if n < 2:
+            return 0.0
+
+        # overnight returns: log(open_t / close_{t-1})
+        overnight = [
+            math.log(bars[i].o / bars[i-1].c)
+            for i in range(1, n)
+            if bars[i-1].c > 0 and bars[i].o > 0
+        ]
+        # open-to-close returns: log(close_t / open_t)
+        otc = [
+            math.log(b.c / b.o)
+            for b in bars
+            if b.o > 0
+        ]
+        # Rogers-Satchell per bar
+        rs = []
+        for b in bars:
+            if b.o > 0 and b.h > 0 and b.l > 0 and b.c > 0:
+                term = (math.log(b.h / b.c) * math.log(b.h / b.o)
+                      + math.log(b.l / b.c) * math.log(b.l / b.o))
+                rs.append(term)
+
+        if not overnight or not otc or not rs:
+            return self._close_to_close(bars)
+
+        var_o  = float(np.var(overnight, ddof=1))
+        var_c  = float(np.var(otc, ddof=1))
+        var_rs = float(np.mean(rs))
+
+        # optimal k (Yang-Zhang 2000, eq. 20)
+        k = 0.34 / (1.34 + (n + 1) / max(n - 1, 1))
+
+        var_yz = var_o + k * var_c + (1.0 - k) * var_rs
+        return math.sqrt(max(var_yz, 0.0) * self.annualization)
+
+    def _close_to_close(self, bars: list[_Bar]) -> float:
+        closes = [b.c for b in bars if b.c > 0]
+        if len(closes) < 2:
+            raise StateError("not enough closes for C2C fallback")
+        rets = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes))]
+        return float(np.std(rets, ddof=1) * math.sqrt(self.annualization))
 
     def rv_primary(self) -> float:
         return self.rv(self.primary_window)
@@ -161,15 +242,27 @@ class RealizedVolEstimator:
         return self.rv(self.secondary_window)
 
     def rv_ratio(self) -> float:
-        """RV(1h) / RV(primary) - main RV spike detector for the kill switch."""
-        if len(self._returns) < 2:
+        """RV(1h) / RV(primary) - kill switch spike detector."""
+        if len(self._bars) < 2:
             raise StateError("not enough data for rv_ratio")
-        rv_1h = abs(self._returns[-1]) * math.sqrt(self.annualization)
+        last = self._bars[-1]
+        # 1h vol: use the last bar's range if OHLC available, else close move
+        if last.h != last.l and last.l > 0:
+            prev = self._bars[-2]
+            rs_1h = (math.log(last.h / last.c) * math.log(last.h / last.o)
+                   + math.log(last.l / last.c) * math.log(last.l / last.o))
+            rv_1h = math.sqrt(max(rs_1h, 0.0) * self.annualization)
+        else:
+            prev = self._bars[-2]
+            if prev.c > 0:
+                rv_1h = abs(math.log(last.c / prev.c)) * math.sqrt(self.annualization)
+            else:
+                rv_1h = 0.0
         return rv_1h / max(self.rv_primary(), 1e-8)
 
     @property
     def n_obs(self) -> int:
-        return len(self._returns)
+        return len(self._bars)
 
 
 # ---- delta tracker ----------------------------------------------------------
@@ -525,12 +618,27 @@ class StateEngine:
     # ---- inbound updates (called by market data layer) ---------------------
 
     def on_index_price(self, price: float) -> None:
+        """Tick-level close update. YZ falls back to C2C if no OHLC bars arrive."""
         prev = self.index._price
         self.index.update(price)
         if prev > 0:
             dS = price - prev
             self.delta_tracker.on_price_move(dS)
             self.rv_estimator.update(price)
+
+    def on_ohlc_bar(self, o: float, h: float, l: float, c: float) -> None:
+        """
+        Hourly OHLC bar - feeds Yang-Zhang directly.
+        Call this instead of on_index_price when the feed provides full bars
+        (e.g. after subscribing to chart.trades or aggregating ticks into bars).
+        Delta tracking still uses the close.
+        """
+        prev = self.index._price
+        self.index.update(c)
+        if prev > 0:
+            dS = c - prev
+            self.delta_tracker.on_price_move(dS)
+        self.rv_estimator.update_ohlc(o, h, l, c)
 
     def on_perp_book_snapshot(self, bids: list, asks: list, seq: int) -> None:
         self.perp_book.apply_snapshot(bids, asks, seq)
