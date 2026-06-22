@@ -45,6 +45,11 @@ class OrderBook:
     Minimal L2 book - bids/asks as sorted lists of (price, size).
     Not trying to be clever here, dicts keyed by price are fast enough
     for options books which rarely have more than 20 levels.
+
+    OFI (Order Flow Imbalance) is computed on every delta update.
+    Formula: OFI_t = dV_bid - dV_ask
+    where dV_bid = size added to best bid, dV_ask = size added to best ask.
+    Normalized to [-1, 1] over a rolling window.
     """
     instrument: str
     bids: dict[float, float] = field(default_factory=dict)
@@ -54,11 +59,23 @@ class OrderBook:
     last_update_ms:  int   = 0
     _max_spread_pct: float = 0.10
 
+    # OFI state
+    _ofi_window: int   = 100       # ticks to normalize over
+    _ofi_raw:    deque = field(init=False)
+    _prev_best_bid: float = 0.0
+    _prev_best_ask: float = 0.0
+    _prev_bid_size: float = 0.0
+    _prev_ask_size: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._ofi_raw = deque(maxlen=self._ofi_window)
+
     def apply_snapshot(self, bids: list[list], asks: list[list], seq: int) -> None:
         self.bids = {float(p): float(s) for p, s in bids}
         self.asks = {float(p): float(s) for p, s in asks}
         self.last_seq       = seq
         self.last_update_ms = _now_ms()
+        self._update_ofi_prev()
 
     def apply_delta(self, changes: list[list], seq: int) -> None:
         if seq != self.last_seq + 1:
@@ -75,6 +92,69 @@ class OrderBook:
 
         self.last_seq       = seq
         self.last_update_ms = _now_ms()
+        self._compute_ofi()
+
+    def _compute_ofi(self) -> None:
+        """
+        OFI per Cont, Kukanov, Stoikov (2014).
+        dV_bid: change in best bid size (positive = more buying pressure)
+        dV_ask: change in best ask size (positive = more selling pressure)
+        OFI = dV_bid - dV_ask
+        """
+        bb = self.best_bid()
+        ba = self.best_ask()
+        if bb is None or ba is None:
+            return
+
+        cur_bid, cur_bid_sz = bb.price, bb.size
+        cur_ask, cur_ask_sz = ba.price, ba.size
+
+        # bid side contribution
+        if cur_bid > self._prev_best_bid:
+            dv_bid = cur_bid_sz              # new best bid - full size counts
+        elif cur_bid == self._prev_best_bid:
+            dv_bid = cur_bid_sz - self._prev_bid_size
+        else:
+            dv_bid = -self._prev_bid_size    # best bid moved down - lost size
+
+        # ask side contribution
+        if cur_ask < self._prev_best_ask:
+            dv_ask = cur_ask_sz
+        elif cur_ask == self._prev_best_ask:
+            dv_ask = cur_ask_sz - self._prev_ask_size
+        else:
+            dv_ask = -self._prev_ask_size
+
+        self._ofi_raw.append(dv_bid - dv_ask)
+        self._update_ofi_prev()
+
+    def _update_ofi_prev(self) -> None:
+        bb = self.best_bid()
+        ba = self.best_ask()
+        self._prev_best_bid = bb.price if bb else 0.0
+        self._prev_bid_size = bb.size  if bb else 0.0
+        self._prev_best_ask = ba.price if ba else 0.0
+        self._prev_ask_size = ba.size  if ba else 0.0
+
+    def ofi(self) -> float:
+        """
+        Normalized OFI in [-1, 1].
+        Positive = buying pressure, negative = selling pressure.
+        Returns 0.0 if not enough data yet.
+        """
+        if len(self._ofi_raw) < 5:
+            return 0.0
+        raw   = list(self._ofi_raw)
+        total = sum(abs(x) for x in raw)
+        if total == 0:
+            return 0.0
+        return sum(raw) / total
+
+    def ofi_raw_sum(self, n: int = 20) -> float:
+        """Unnormalized OFI sum over last n ticks. Useful for sizing signals."""
+        if not self._ofi_raw:
+            return 0.0
+        return float(sum(list(self._ofi_raw)[-n:]))
 
     def best_bid(self) -> PriceLevel | None:
         if not self.bids:
@@ -422,7 +502,148 @@ class VolPremiumSignal:
         return len(self._raw_premiums)
 
 
-# ---- SVI calibration --------------------------------------------------------
+# ---- SABR calibration -------------------------------------------------------
+
+@dataclass
+class _SABRParams:
+    """
+    SABR (Hagan et al. 2002) parameters per expiry.
+    We use beta=0.5 (fixed, common for equity/crypto vol - between log-normal and normal)
+    and calibrate alpha, rho, nu from the smile.
+
+    sigma_SABR(K, F) = alpha * (FK)^((beta-1)/2) * z/x(z) * [1 + ...]
+    where z = (nu/alpha) * (FK)^((1-beta)/2) * log(F/K)
+          x(z) = log((sqrt(1-2*rho*z+z^2) + z - rho) / (1-rho))
+
+    Why SABR instead of (or alongside) SVI:
+    - SVI is better for interpolation across strikes on a single slice
+    - SABR is better for hedging: it gives analytic dVega/dSpot (vanna) and dVega/dVol (volga)
+    - We use SABR to compute skew-adjusted hedge ratios in the AS pricer
+    - If SABR calibration fails, fall back to flat vol (SVI already handles interpolation)
+    """
+    alpha: float   # vol of vol level (> 0)
+    beta:  float   # CEV exponent (fixed at 0.5)
+    rho:   float   # spot-vol correlation (-1 < rho < 1)
+    nu:    float   # vol of vol (> 0)
+
+    def implied_vol(self, F: float, K: float, T: float) -> float:
+        """Hagan et al. 2002, eq. 2.17b approximation."""
+        if T <= 0 or F <= 0 or K <= 0:
+            return 0.0
+
+        beta   = self.beta
+        FK_mid = math.sqrt(F * K)
+        # ATM (F=K): log_FK=0, use series expansion to avoid 0/0
+        is_atm = abs(F - K) / F < 1e-6
+
+        if is_atm:
+            # Simplified ATM formula: sigma_SABR = alpha / F^(1-beta) * correction
+            sigma_atm = self.alpha / (
+                F ** (1 - beta) * (
+                    1 + (
+                        ((1 - beta) ** 2 / 24) * self.alpha ** 2 / F ** (2 * (1 - beta))
+                        + 0.25 * self.rho * self.beta * self.nu * self.alpha / F ** (1 - beta)
+                        + (2 - 3 * self.rho ** 2) / 24 * self.nu ** 2
+                    ) * T
+                )
+            )
+            return max(sigma_atm, 0.0)
+
+        log_FK = math.log(F / K)
+
+        # z and x(z) for smile wings
+        z   = (self.nu / self.alpha) * FK_mid ** (1 - beta) * log_FK
+        x_z = _sabr_x(z, self.rho) if abs(z) > 1e-8 else 1.0
+        z_over_x = z / x_z if abs(x_z) > 1e-10 else 1.0
+
+        sigma_atm = self.alpha / (
+            FK_mid ** (1 - beta) * (
+                1
+                + ((1 - beta) ** 2 / 24) * log_FK ** 2
+                + ((1 - beta) ** 4 / 1920) * log_FK ** 4
+            )
+        )
+
+        correction = (
+            1
+            + (
+                ((1 - beta) ** 2 / 24) * self.alpha ** 2 / FK_mid ** (2 * (1 - beta))
+                + 0.25 * self.rho * self.beta * self.nu * self.alpha / FK_mid ** (1 - beta)
+                + (2 - 3 * self.rho ** 2) / 24 * self.nu ** 2
+            ) * T
+        )
+
+        return max(sigma_atm * z_over_x * correction, 0.0)
+
+    def vanna(self, F: float, K: float, T: float, dF: float = 1.0) -> float:
+        """
+        Numerical dSigma/dF - used for skew-aware delta hedge adjustment.
+        Bump-and-reprice, not analytic. Fast enough given call frequency.
+        """
+        iv_up   = self.implied_vol(F + dF, K, T)
+        iv_down = self.implied_vol(F - dF, K, T)
+        return (iv_up - iv_down) / (2 * dF)
+
+    def volga(self, F: float, K: float, T: float, dvol: float = 0.001) -> float:
+        """Numerical d2Sigma/dSigma2 - convexity of vol."""
+        iv_base = self.implied_vol(F, K, T)
+        iv_up   = self.implied_vol(F, K * math.exp(dvol), T)
+        iv_down = self.implied_vol(F, K * math.exp(-dvol), T)
+        return (iv_up - 2 * iv_base + iv_down) / (dvol ** 2)
+
+
+def _sabr_x(z: float, rho: float) -> float:
+    """x(z) function from SABR - eq 2.13b in Hagan et al."""
+    disc = math.sqrt(1 - 2 * rho * z + z ** 2)
+    return math.log((disc + z - rho) / (1 - rho))
+
+
+def _fit_sabr(
+    strikes: list[float],
+    ivs:     list[float],
+    forward: float,
+    T:       float,
+    beta:    float = 0.5,
+) -> _SABRParams | None:
+    """
+    Calibrate SABR (alpha, rho, nu) with fixed beta.
+    Uses scipy least_squares. Same fallback pattern as SVI: returns None on failure.
+    """
+    if len(strikes) < 3 or T <= 0 or forward <= 0:
+        return None
+
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None
+
+    # ATM vol as initial alpha estimate.
+    # SABR alpha has units of vol * F^(1-beta). For beta=0.5, F=60000:
+    # alpha ~ atm_iv * sqrt(F) ~ 0.65 * 245 ~ 159. Bound must accommodate this.
+    atm_iv = min(ivs, key=lambda iv: abs(strikes[ivs.index(iv)] - forward))
+    atm_fk  = forward ** (1 - beta)
+    alpha0  = atm_iv * atm_fk
+    alpha_max = max(alpha0 * 5.0, 10.0)
+
+    def residuals(params: list) -> list:
+        alpha, rho, nu = params
+        if alpha <= 0 or nu <= 0 or not (-0.999 < rho < 0.999):
+            return [1e6] * len(strikes)
+        p = _SABRParams(alpha=alpha, beta=beta, rho=rho, nu=nu)
+        return [p.implied_vol(forward, K, T) - iv for K, iv in zip(strikes, ivs)]
+
+    try:
+        result = least_squares(
+            residuals,
+            x0     = [alpha0, -0.3, 0.4],
+            bounds = ([1e-6, -0.999, 1e-4], [alpha_max, 0.999, 10.0]),
+            max_nfev = 300,
+            ftol   = 1e-6,
+        )
+        alpha, rho, nu = result.x
+        return _SABRParams(alpha=alpha, beta=beta, rho=rho, nu=nu)
+    except Exception:
+        return None
 
 def _norm_cdf(x: float) -> float:
     """Abramowitz & Stegun. Same one used in deribit_gateway, keep in sync."""
@@ -527,14 +748,15 @@ class VolSurface:
     for strikes that aren't directly quoted. That's what this solves.
     """
     asset:            str
-    svi_min_strikes:  int   = 4   # minimum strikes per expiry to attempt SVI fit
-    refit_interval_s: float = 60.0  # don't refit on every tick
+    svi_min_strikes:  int   = 4
+    refit_interval_s: float = 60.0
 
-    _iv_grid:   dict[tuple[int, float], float] = field(init=False, default_factory=dict)
-    _svi_params: dict[int, _SVIParams]          = field(init=False, default_factory=dict)
-    _forwards:   dict[int, float]               = field(init=False, default_factory=dict)
-    _last_fit_s: dict[int, float]               = field(init=False, default_factory=dict)
-    _last_update_ms: int                        = field(init=False, default=0)
+    _iv_grid:    dict[tuple[int, float], float] = field(init=False, default_factory=dict)
+    _svi_params: dict[int, _SVIParams]           = field(init=False, default_factory=dict)
+    _sabr_params: dict[int, _SABRParams]         = field(init=False, default_factory=dict)
+    _forwards:   dict[int, float]                = field(init=False, default_factory=dict)
+    _last_fit_s: dict[int, float]                = field(init=False, default_factory=dict)
+    _last_update_ms: int                         = field(init=False, default=0)
 
     def update_strike(self, expiry_ts: int, strike: float, iv: float) -> None:
         self._iv_grid[(expiry_ts, strike)] = iv
@@ -559,18 +781,60 @@ class VolSurface:
             return
 
         ivs     = [self._iv_grid[(expiry_ts, s)] for s in strikes_for_expiry]
-        forward = self._forwards.get(expiry_ts, min(strikes_for_expiry))  # rough fallback
+        forward = self._forwards.get(expiry_ts, min(strikes_for_expiry))
         T       = max(0.0, (expiry_ts - time.time()) / (365 * 24 * 3600))
 
-        params = _fit_svi(strikes_for_expiry, ivs, forward, T)
-        if params is not None:
-            self._svi_params[expiry_ts] = params
-            log.debug(
-                f"SVI fit {self.asset} expiry={expiry_ts} "
-                f"a={params.a:.4f} b={params.b:.4f} rho={params.rho:.3f} "
-                f"m={params.m:.4f} sigma={params.sigma:.4f}"
-            )
+        # SVI fit - interpolation across strikes
+        svi = _fit_svi(strikes_for_expiry, ivs, forward, T)
+        if svi is not None:
+            self._svi_params[expiry_ts] = svi
+            log.debug(f"SVI fit {self.asset} expiry={expiry_ts} rho={svi.rho:.3f}")
+
+        # SABR fit - skew-aware greeks (vanna, volga)
+        sabr = _fit_sabr(strikes_for_expiry, ivs, forward, T)
+        if sabr is not None:
+            self._sabr_params[expiry_ts] = sabr
+            log.debug(f"SABR fit {self.asset} expiry={expiry_ts} alpha={sabr.alpha:.4f} rho={sabr.rho:.3f} nu={sabr.nu:.4f}")
+
         self._last_fit_s[expiry_ts] = now
+
+    def sabr_vanna(self, expiry_ts: int, strike: float, forward: float) -> float:
+        """
+        dSigma/dF from SABR - tells you how much IV changes when spot moves.
+        Used to adjust delta hedge: true_delta = BS_delta + vanna_adjustment.
+        Returns 0.0 if SABR not calibrated yet.
+        """
+        params = self._sabr_params.get(expiry_ts)
+        if params is None:
+            return 0.0
+        T = max(1e-6, (expiry_ts - time.time()) / (365 * 24 * 3600))
+        return params.vanna(forward, strike, T)
+
+    def sabr_volga(self, expiry_ts: int, strike: float, forward: float) -> float:
+        """
+        d2Sigma/dSigma2 from SABR - vol convexity.
+        Useful for sizing vega risk on wing strikes.
+        Returns 0.0 if not calibrated.
+        """
+        params = self._sabr_params.get(expiry_ts)
+        if params is None:
+            return 0.0
+        T = max(1e-6, (expiry_ts - time.time()) / (365 * 24 * 3600))
+        return params.volga(forward, strike, T)
+
+    def sabr_iv(self, expiry_ts: int, strike: float, forward: float) -> float | None:
+        """
+        SABR-implied vol at a strike. Returns None if not calibrated.
+        Prefer iv_at_strike() (SVI) for interpolation - use this for hedge ratio adjustment.
+        """
+        params = self._sabr_params.get(expiry_ts)
+        if params is None:
+            return None
+        T = max(1e-6, (expiry_ts - time.time()) / (365 * 24 * 3600))
+        return params.implied_vol(forward, strike, T)
+
+    def has_sabr(self, expiry_ts: int) -> bool:
+        return expiry_ts in self._sabr_params
 
     def iv_at_strike(self, expiry_ts: int, strike: float, forward: float) -> float:
         """
@@ -894,6 +1158,22 @@ class StateEngine:
     def has_svi(self, expiry_ts: int) -> bool:
         return self.vol_surface.has_svi(expiry_ts)
 
+    def has_sabr(self, expiry_ts: int) -> bool:
+        return self.vol_surface.has_sabr(expiry_ts)
+
+    def sabr_vanna(self, expiry_ts: int, strike: float) -> float:
+        return self.vol_surface.sabr_vanna(expiry_ts, strike, self.index.price())
+
+    def sabr_volga(self, expiry_ts: int, strike: float) -> float:
+        return self.vol_surface.sabr_volga(expiry_ts, strike, self.index.price())
+
+    def ofi(self) -> float:
+        """Normalized OFI from perp L2. Positive = buying pressure."""
+        return self.perp_book.ofi()
+
+    def ofi_raw(self, n: int = 20) -> float:
+        return self.perp_book.ofi_raw_sum(n)
+
     def needs_hedge(self) -> bool:
         return self.delta_tracker.needs_hedge()
 
@@ -941,6 +1221,7 @@ class StateEngine:
                 "size_mult":      self.funding.size_multiplier(),
                 "delta_accum":    self.delta_tracker.accumulated_delta,
                 "needs_hedge":    self.delta_tracker.needs_hedge(),
+                "ofi":            self.perp_book.ofi(),
                 "net_vega":       self.inventory.net_vega,
                 "net_gamma":      self.inventory.net_gamma,
                 "net_theta":      self.inventory.net_theta,
