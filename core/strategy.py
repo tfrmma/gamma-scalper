@@ -60,55 +60,71 @@ class StrategySignal:
 
 class ASPricer:
     """
-    A&S 2008, adapted for options vol space.
+    A&S 2008, adapted for options vol space, with SABR skew correction.
 
-    Instead of pricing in dollar spread around mid price, we work in vol points
-    around the ATM IV. The math is the same, the units are just cleaner for options.
+    Base model:
+      reservation_vol = mid_vol + skew
+      spread_vol      = gamma*sigma^2*T + (2/gamma)*ln(1 + gamma/k)
 
-    reservation_vol = mid_vol - gamma * sigma^2 * (T - t) * q
-    spread_vol      = gamma * sigma^2 * (T - t) + (2/gamma) * ln(1 + gamma/k)
+    SABR extension:
+      When SABR is calibrated, we apply a vanna correction to the reservation price.
+      Vanna (dSigma/dF) tells us how much the IV will move when spot moves - this
+      affects the true cost of holding delta risk. Intuitively: if you're short a call
+      and spot rips, IV also goes up (positive vanna on calls), so your real exposure
+      is larger than Black-Scholes delta alone suggests.
 
-    where:
-      gamma = risk aversion (from config)
-      sigma = realized vol (from state engine)
-      T - t = time to expiry in years (fraction)
-      q     = net inventory in vega-normalized units
-      k     = arrival intensity (calibrated or from config)
+      skew_sabr = vanna * net_delta_exposure * spot_move_1sigma
+      reservation_vol += skew_sabr
+
+    MLE k calibration:
+      Poisson inter-arrival MLE: k_hat = n / sum(intervals)
+      This is the exact MLE for exponential inter-arrivals, not the mean proxy.
+      Exponential(lambda) has MLE lambda_hat = n / sum(t_i).
+      We decay towards prior k to avoid overfitting on thin windows.
     """
 
     def __init__(self, cfg: Config) -> None:
         as_cfg = cfg.strategy.avellaneda_stoikov
-        self.gamma              = as_cfg.gamma
-        self.k                  = as_cfg.k
+        self.gamma_as           = as_cfg.gamma     # renamed to avoid clash with SABR gamma
+        self.k_prior            = as_cfg.k
         self.T_default_h        = as_cfg.T_hours_default
         self.spread_min         = as_cfg.spread_min_vol_pts
         self.spread_max         = as_cfg.spread_max_vol_pts
         self.skew_cap           = as_cfg.skew_cap_vol_pts
-        self._k_calibrated      = as_cfg.k   # gets updated from live trades
+        self._k_mle             = as_cfg.k
+        self._k_decay           = 0.1    # weight on prior vs MLE, tune in live
         self._last_calibration  = 0.0
+        self._n_calibrations    = 0
 
     def quote(
         self,
-        mid_vol:    float,   # current ATM IV (annualized, e.g. 0.65)
-        rv:         float,   # realized vol (annualized)
-        dte_hours:  float,   # time to expiry in hours
-        inventory:  float,   # net vega position (negative = short)
+        mid_vol:    float,
+        rv:         float,
+        dte_hours:  float,
+        inventory:  float,
+        vanna:      float = 0.0,   # SABR dSigma/dF - 0 falls back to pure A&S
+        spot:       float = 0.0,   # needed for vanna adjustment
     ) -> Quote:
-        T = dte_hours / 8760.0   # hours to years, crypto annualization
+        T = dte_hours / 8760.0
 
-        # inventory skew - the core of AS for short gamma
-        # negative inventory (short options) pushes reservation vol up
-        # so we quote higher, discouraging more shorts when already short
-        skew = self.gamma * (rv ** 2) * T * inventory
-        skew = max(-self.skew_cap, min(self.skew_cap, skew))
+        # base inventory skew
+        skew = self.gamma_as * (rv ** 2) * T * inventory
 
+        # SABR vanna correction: if vol moves with spot, reservation price shifts
+        # vanna > 0 means IV rises when spot rises - being short calls + long spot hedge
+        # means your effective vega exposure is amplified. Widen the quote.
+        if abs(vanna) > 0 and spot > 0:
+            rv_1sigma   = rv * math.sqrt(1.0 / 8760.0)   # 1h 1-sigma move
+            spot_move   = spot * rv_1sigma
+            skew_sabr   = vanna * spot_move * abs(inventory) * 0.1   # 0.1 = dampening
+            skew += skew_sabr
+
+        skew    = max(-self.skew_cap, min(self.skew_cap, skew))
         reserve = mid_vol + skew
 
-        # optimal spread - wider when: high gamma, high vol, long T, illiquid (low k)
-        vol_term    = self.gamma * (rv ** 2) * T
-        arrival_term = (2.0 / self.gamma) * math.log(1.0 + self.gamma / self._k_calibrated)
-        spread = vol_term + arrival_term
-        spread = max(self.spread_min, min(self.spread_max, spread))
+        vol_term     = self.gamma_as * (rv ** 2) * T
+        arrival_term = (2.0 / self.gamma_as) * math.log(1.0 + self.gamma_as / self._k_mle)
+        spread = max(self.spread_min, min(self.spread_max, vol_term + arrival_term))
 
         half = spread / 2.0
         return Quote(
@@ -122,19 +138,34 @@ class ASPricer:
 
     def recalibrate_k(self, trade_intervals: list[float]) -> None:
         """
-        MLE estimate of k from observed inter-trade times.
-        trade_intervals: list of seconds between consecutive fills.
-        Only call when len >= calibration_min_trades, checked by caller.
+        MLE for Poisson arrival rate: lambda_hat = n / sum(intervals).
+        Exact MLE for exponential inter-arrivals (Poisson process).
+        Blended with prior to avoid cold-start instability.
         """
         if not trade_intervals:
             return
-        # Poisson arrival: k = 1 / mean_interval (in vol-normalized units)
-        # this is a rough proxy - good enough for daily recalibration
-        mean_interval = sum(trade_intervals) / len(trade_intervals)
-        if mean_interval > 0:
-            self._k_calibrated = 1.0 / mean_interval
-            log.info(f"AS k recalibrated: {self._k_calibrated:.4f} from {len(trade_intervals)} trades")
+        n          = len(trade_intervals)
+        total_time = sum(trade_intervals)
+        if total_time <= 0:
+            return
+
+        k_mle = n / total_time   # exact Poisson MLE
+
+        # blend with prior: more weight on MLE as we get more data
+        # after 200 trades, prior weight ~= 0.1 * (1/2)^(n/50) ~ negligible
+        prior_weight = self._k_decay * math.exp(-n / 50.0)
+        self._k_mle  = (1 - prior_weight) * k_mle + prior_weight * self.k_prior
+
         self._last_calibration = time.monotonic()
+        self._n_calibrations  += 1
+        log.info(
+            f"k recalibrated (MLE) | k_mle={k_mle:.4f} k_blended={self._k_mle:.4f} "
+            f"n={n} total_time={total_time:.1f}s calibration={self._n_calibrations}"
+        )
+
+    @property
+    def k_current(self) -> float:
+        return self._k_mle
 
 
 # ---- position sizer ---------------------------------------------------------
@@ -311,6 +342,10 @@ class GammaScalpStrategy:
         self._last_fill_time:  float       = 0.0
         self._consecutive_neg_h: float     = 0.0
         self._last_signal_ms:    int       = 0
+        # OFI threshold: skip entry when perp flow is too one-sided
+        # 0.6 = 80%+ of recent ticks weighted one direction
+        # tune this in live - too tight and you miss entries, too loose and you get run over
+        self._ofi_entry_threshold: float   = 0.60
 
         log.info(f"strategy ready | asset={asset} mode={cfg.strategy.strategy.mode}")
 
@@ -383,7 +418,15 @@ class GammaScalpStrategy:
         state = self.state
 
         if not state.signal_enter():
-            return self._hold(f"premium below entry threshold")
+            return self._hold("premium below entry threshold")
+
+        # OFI filter: don't enter into strong directional flow.
+        # If perp book shows heavy one-sided pressure, the move is likely to
+        # continue - our short gamma delta hedge will be chasing.
+        # Threshold: |OFI| > 0.6 means 80%+ of recent flow is one-sided.
+        ofi = state.ofi()
+        if abs(ofi) > self._ofi_entry_threshold:
+            return self._hold(f"OFI filter: {ofi:+.2f} (directional flow, skip)")
 
         spot    = state.spot()
         rv      = state.rv()
@@ -399,17 +442,17 @@ class GammaScalpStrategy:
         if target <= 0:
             return self._hold("sizer returned 0")
 
-        # need a valid expiry to quote - caller responsible for picking it
-        # we just check that the vol surface has data before returning ENTER
         if state.vol_surface.n_strikes == 0:
             return self._hold("vol surface empty, waiting for greeks")
 
-        # compute the quote so execution layer knows where to send the order
         try:
             expiry_ts = self._nearest_expiry()
             iv        = state.atm_iv(expiry_ts)
             dte_h     = _dte_hours(expiry_ts)
-            inventory = state.inventory.net_vega  # negative when short
+            inventory = state.inventory.net_vega
+            # SABR vanna for skew-aware spread adjustment
+            atm_strike = round(spot / 1000) * 1000
+            vanna      = state.sabr_vanna(expiry_ts, atm_strike)
         except StateError as e:
             return self._hold(f"quote inputs missing: {e}")
 
@@ -418,12 +461,16 @@ class GammaScalpStrategy:
             rv        = rv,
             dte_hours = dte_h,
             inventory = inventory,
+            vanna     = vanna,
+            spot      = spot,
         )
 
         regime = state.funding_regime()
         log.info(
             f"ENTER signal | premium={premium:.1%} rv={rv:.1%} iv={iv:.1%} "
-            f"notional=${target:,.0f} regime={regime.name} spread={quote.spread_vol:.2f}vp"
+            f"notional=${target:,.0f} regime={regime.name} "
+            f"spread={quote.spread_vol:.2f}vp ofi={ofi:+.2f} "
+            f"vanna={vanna:.4f} sabr={'yes' if state.has_sabr(expiry_ts) else 'no'}"
         )
 
         return StrategySignal(
@@ -431,7 +478,7 @@ class GammaScalpStrategy:
             asset                = self.asset,
             quote                = quote,
             target_notional_usd  = target,
-            reason               = f"premium={premium:.1%} mult={mult:.1f}",
+            reason               = f"premium={premium:.1%} mult={mult:.1f} ofi={ofi:+.2f}",
         )
 
     def _manage_position(self) -> StrategySignal:
@@ -547,8 +594,9 @@ class GammaScalpStrategy:
             "rv":               rv,
             "size_mult":        mult,
             "neg_edge_h":       self._consecutive_neg_h,
-            "k_calibrated":     self.pricer._k_calibrated,
+            "k_mle":            self.pricer.k_current,
             "fills_tracked":    len(self._trade_intervals),
+            "ofi":              self.state.ofi(),
         }
 
 
