@@ -83,6 +83,12 @@ max_hedge_interval_h        = 8.0      # hard failsafe - hedge even if delta did
 execution_style             = "aggressive_limit"
 aggressive_limit_timeout_ms = 500
 
+# OFI entry filter - skip entry when perp book is too one-sided
+# 0.0 = disabled, 1.0 = only enter on perfectly balanced flow
+# 0.6 is a reasonable starting point - tune in live
+[ofi]
+entry_threshold = 0.60
+
 [rolling]
 roll_on_dte_below             = 2
 roll_on_moneyness_pct         = 0.05   # underlying drifted too far from strike
