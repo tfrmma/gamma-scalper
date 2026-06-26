@@ -253,10 +253,15 @@ async def test_risk_drawdown_halts():
     risk._on_halt = on_halt
 
     # simulate loss exceeding intraday limit ($2000)
+    # inject a fill that crystallizes a $2001 loss
+    risk._fill_pnl.record_entry("BTC-call", 0.065, 1.0)  # entered at 6.5% vol
+    risk._fill_pnl.on_fill("BTC-call", 0.285, 1.0, "buy")  # buy back 22% higher = big loss
+    # force drawdown tracker to see a high water mark then a drop
     risk._drawdown._session_high = 0.0
     risk._drawdown._pnl_log.clear()
     risk._drawdown._pnl_log.append((time.time(), 0.0))
-    risk._cumulative_pnl = -2001.0
+    # override realized directly to hit limit cleanly
+    risk._fill_pnl._realized = -2001.0
 
     await risk._run_checks()
     assert risk.is_halted
