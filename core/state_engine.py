@@ -1059,25 +1059,62 @@ class StateEngine:
         self.inventory   = InventoryState(asset=asset)
         self.index       = IndexTracker()
 
+        # hourly bar accumulator for RV estimator (bug fix: don't feed raw ticks)
+        self._current_bar:   dict | None = None
+        self._current_bar_h: int         = -1
+
         self._ob_cfg = ob
         log.info(f"state engine ready | asset={asset}")
 
     # ---- inbound updates (called by market data layer) ---------------------
 
     def on_index_price(self, price: float) -> None:
-        """Tick-level close update. YZ falls back to C2C if no OHLC bars arrive."""
+        """
+        Tick-level price update. Accumulates into an hourly bar before
+        feeding the RV estimator - annualization_factor=8760 assumes
+        hourly observations, not per-tick. Sending raw ticks inflated
+        the RV ratio on any normal market move.
+
+        Delta tracking fires on every tick (correct - that's the point).
+        RV only updates when the bar closes.
+        """
+        now_h = int(time.time() // 3600)   # current hour bucket
+
         prev = self.index._price
         self.index.update(price)
+
         if prev > 0:
             dS = price - prev
             self.delta_tracker.on_price_move(dS)
-            self.rv_estimator.update(price)
+
+        # accumulate into current hour bar
+        bar = self._current_bar
+        if bar is None or self._current_bar_h != now_h:
+            # close the previous bar and push to estimator
+            if bar is not None:
+                self.rv_estimator.update_ohlc(bar["o"], bar["h"], bar["l"], bar["c"])
+            self._current_bar   = {"o": price, "h": price, "l": price, "c": price}
+            self._current_bar_h = now_h
+        else:
+            bar["h"] = max(bar["h"], price)
+            bar["l"] = min(bar["l"], price)
+            bar["c"] = price
+
+    def flush_bar(self) -> None:
+        """
+        Force-close the current accumulating bar and push to RV estimator.
+        Call this in tests to simulate hour boundaries, or at session end.
+        """
+        if self._current_bar is not None:
+            bar = self._current_bar
+            self.rv_estimator.update_ohlc(bar["o"], bar["h"], bar["l"], bar["c"])
+            self._current_bar   = None
+            self._current_bar_h = -1
 
     def on_ohlc_bar(self, o: float, h: float, l: float, c: float) -> None:
         """
         Hourly OHLC bar - feeds Yang-Zhang directly.
-        Call this instead of on_index_price when the feed provides full bars
-        (e.g. after subscribing to chart.trades or aggregating ticks into bars).
+        Call this instead of on_index_price when the feed provides full bars.
         Delta tracking still uses the close.
         """
         prev = self.index._price
