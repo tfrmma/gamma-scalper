@@ -70,12 +70,17 @@ def make_system(seed: int = 42):
 
 
 def warm_state(state: StateEngine, seed: int = 42, n: int = 30, vol: float = 0.005) -> float:
-    """Feed enough price history to make RV valid. Returns final price."""
+    """
+    Feed enough hourly price history to make RV valid.
+    Simulates n hourly bars by flushing after each price update.
+    Returns final price.
+    """
     random.seed(seed)
     price = 60000.0
     for _ in range(n):
         price *= math.exp(random.gauss(0, vol))
         state.on_index_price(price)
+        state.flush_bar()   # simulate hour closing
     return price
 
 
