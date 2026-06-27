@@ -15,21 +15,7 @@ from core.execution import ExecutionEngine, ExchangeGateway
 from core.risk_engine import RiskEngine, KillReason
 from core.market_data import MarketDataCoordinator
 from infra.deribit_gateway import DeribitGateway
-
-
-def setup_logging(level: str) -> None:
-    fmt = "%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s"
-    logging.basicConfig(
-        level   = getattr(logging, level.upper(), logging.INFO),
-        format  = fmt,
-        datefmt = "%Y-%m-%d %H:%M:%S",
-        handlers= [
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("system.log", encoding="utf-8"),
-        ],
-    )
-    if level.upper() != "DEBUG":
-        logging.getLogger("websockets").setLevel(logging.WARNING)
+from infra.logging_setup import setup_logging
 
 
 log = logging.getLogger("main")
@@ -304,7 +290,6 @@ def main() -> None:
 
     cfg    = load_config(args.config)
     assets = [args.asset] if args.asset else cfg.active_assets()
-
     if cfg.market.venue.use_testnet:
         log.warning(f"TESTNET | assets={assets} dry_run={args.dry_run}")
     else:
@@ -318,4 +303,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
