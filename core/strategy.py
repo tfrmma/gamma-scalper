@@ -248,69 +248,122 @@ def compute_hedge(
     """
     Computes the perp hedge needed to flatten delta.
 
-    Short straddle delta should be ~0 at ATM, but it drifts as spot moves.
-    We hedge in USD notional on the perp.
+    Uses delta_tracker.accumulated_delta, NOT inventory.net_delta.
+    inventory.net_delta only updates on fills — it's the delta at entry,
+    which for an ATM straddle is ~0 and stays 0 forever between fills.
+    accumulated_delta tracks the actual drift: gamma * dS on every tick.
 
-    net_delta is in option units (delta per contract).
-    Convert to USD notional: notional = delta * spot * contract_size.
-    Negative net_delta (short options drifting ITM on puts) -> need long perp.
+    Sign convention:
+      accumulated_delta > 0 means we've drifted long delta (spot moved up,
+      calls gained more delta than puts lost). Sell perp to flatten.
+      accumulated_delta < 0: spot moved down, drifted short. Buy perp.
     """
     if not state.needs_hedge():
         return None
 
-    net_delta    = state.inventory.net_delta
+    accumulated  = state.delta_tracker.accumulated_delta
     spot         = state.spot()
     contract_sz  = cfg.market.assets[asset].contract_size
-    notional_usd = abs(net_delta) * spot * contract_sz
+
+    # accumulated is in option delta units, convert to USD notional
+    notional_usd = abs(accumulated) * spot * contract_sz
 
     if notional_usd < cfg.market.assets[asset].min_trade_amount_perp:
-        # rounding noise, not worth a round-trip
         return None
 
-    # sign: if net_delta > 0 (long delta from options), sell perp to flatten
-    side = "sell" if net_delta > 0 else "buy"
+    side = "sell" if accumulated > 0 else "buy"
 
     return HedgeOrder(
         instrument   = cfg.market.assets[asset].perp_instrument,
         side         = side,
         notional_usd = notional_usd,
-        reason       = f"delta={net_delta:.4f} spot={spot:.0f}",
+        reason       = f"accumulated_delta={accumulated:.4f} spot={spot:.0f}",
     )
 
 
 # ---- main strategy ----------------------------------------------------------
 
 @dataclass
-class PositionState:
-    """Thin container for current open position metadata."""
-    is_open:       bool  = False
-    expiry_ts:     int   = 0
-    strike:        float = 0.0
-    iv_at_entry:   float = 0.0
-    entry_time_ms: int   = 0
-    notional_usd:  float = 0.0
-
-    def open(self, expiry_ts: int, strike: float, iv: float, notional: float) -> None:
-        self.is_open       = True
-        self.expiry_ts     = expiry_ts
-        self.strike        = strike
-        self.iv_at_entry   = iv
-        self.entry_time_ms = _now_ms()
-        self.notional_usd  = notional
-
-    def close(self) -> None:
-        self.is_open = False
-        self.expiry_ts     = 0
-        self.strike        = 0.0
-        self.iv_at_entry   = 0.0
-        self.entry_time_ms = 0
-        self.notional_usd  = 0.0
+class _Leg:
+    """One expiry/strike position."""
+    expiry_ts:     int
+    strike:        float
+    iv_at_entry:   float
+    entry_time_ms: int
+    notional_usd:  float
 
     def dte_hours(self) -> float:
-        if not self.is_open or self.expiry_ts == 0:
-            return 0.0
         remaining_ms = self.expiry_ts * 1000 - int(time.time() * 1000)
         return max(0.0, remaining_ms / 3_600_000)
+
+
+class PositionState:
+    """
+    Registry of all open option legs.
+
+    Replaces the single-leg dataclass that silently overwrote on the second
+    on_position_opened() call. Now supports concurrent legs (roll overlap,
+    multi-expiry strangles, etc).
+
+    Strategy logic queries via:
+      is_open        -> any leg exists
+      legs           -> dict[expiry_ts, _Leg]
+      primary_leg    -> leg closest to target DTE (what roll/exit logic cares about)
+    """
+
+    def __init__(self) -> None:
+        self.legs: dict[int, _Leg] = {}   # expiry_ts -> _Leg
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self.legs)
+
+    @property
+    def primary_leg(self) -> _Leg | None:
+        """Leg with smallest DTE — the one most likely to need rolling."""
+        if not self.legs:
+            return None
+        return min(self.legs.values(), key=lambda l: l.dte_hours())
+
+    # convenience shims for code that used the old single-leg attributes
+    @property
+    def expiry_ts(self) -> int:
+        l = self.primary_leg
+        return l.expiry_ts if l else 0
+
+    @property
+    def strike(self) -> float:
+        l = self.primary_leg
+        return l.strike if l else 0.0
+
+    @property
+    def iv_at_entry(self) -> float:
+        l = self.primary_leg
+        return l.iv_at_entry if l else 0.0
+
+    @property
+    def notional_usd(self) -> float:
+        return sum(l.notional_usd for l in self.legs.values())
+
+    def dte_hours(self) -> float:
+        l = self.primary_leg
+        return l.dte_hours() if l else 0.0
+
+    def open(self, expiry_ts: int, strike: float, iv: float, notional: float) -> None:
+        self.legs[expiry_ts] = _Leg(
+            expiry_ts     = expiry_ts,
+            strike        = strike,
+            iv_at_entry   = iv,
+            entry_time_ms = _now_ms(),
+            notional_usd  = notional,
+        )
+
+    def close(self, expiry_ts: int | None = None) -> None:
+        """Close one leg (by expiry) or all legs if expiry_ts is None."""
+        if expiry_ts is None:
+            self.legs.clear()
+        else:
+            self.legs.pop(expiry_ts, None)
 
 
 class GammaScalpStrategy:
@@ -362,11 +415,11 @@ class GammaScalpStrategy:
 
     def on_position_opened(self, expiry_ts: int, strike: float, iv: float, notional: float) -> None:
         self.position.open(expiry_ts, strike, iv, notional)
-        log.info(f"position opened | strike={strike} iv={iv:.1%} notional=${notional:,.0f}")
+        log.info(f"position opened | expiry={expiry_ts} strike={strike} iv={iv:.1%} notional=${notional:,.0f} legs={len(self.position.legs)}")
 
-    def on_position_closed(self) -> None:
-        self.position.close()
-        log.info("position closed")
+    def on_position_closed(self, expiry_ts: int | None = None) -> None:
+        self.position.close(expiry_ts)
+        log.info(f"position closed | expiry={expiry_ts} remaining_legs={len(self.position.legs)}")
 
     def tick(self) -> StrategySignal:
         """
@@ -482,10 +535,13 @@ class GammaScalpStrategy:
         )
 
     def _manage_position(self) -> StrategySignal:
-        state = self.state
-        pos   = self.position
+        state   = self.state
+        pos     = self.position
+        primary = pos.primary_leg
 
-        # exit check first
+        if primary is None:
+            return self._hold("position marked open but no legs found")
+
         if state.signal_exit():
             return StrategySignal(
                 action = StrategyAction.EXIT,
@@ -493,17 +549,16 @@ class GammaScalpStrategy:
                 reason = f"premium compressed: {state.vol_premium.premium():.1%}",
             )
 
-        # roll check
         try:
             spot     = state.spot()
-            iv_now   = state.atm_iv(pos.expiry_ts)
-            dte_h    = pos.dte_hours()
+            iv_now   = state.atm_iv(primary.expiry_ts)
+            dte_h    = primary.dte_hours()
             do_roll, roll_reason = self.roller.should_roll(
-                dte_hours    = dte_h,
-                spot         = spot,
-                strike       = pos.strike,
-                iv_now       = iv_now,
-                iv_at_entry  = pos.iv_at_entry,
+                dte_hours   = dte_h,
+                spot        = spot,
+                strike      = primary.strike,
+                iv_now      = iv_now,
+                iv_at_entry = primary.iv_at_entry,
             )
         except StateError as e:
             log.warning(f"roll check failed: {e}")
@@ -517,7 +572,6 @@ class GammaScalpStrategy:
                 reason = roll_reason,
             )
 
-        # delta hedge check - most common path
         hedge = compute_hedge(state, self.asset, self.cfg)
         if hedge is not None:
             return StrategySignal(
@@ -577,6 +631,7 @@ class GammaScalpStrategy:
     def status(self) -> dict:
         """Snapshot for logging. Same pattern as StateEngine.snapshot()."""
         pos = self.position
+        primary = pos.primary_leg
         try:
             premium = self.state.vol_premium.premium()
             mult    = self.state.size_multiplier()
@@ -587,8 +642,9 @@ class GammaScalpStrategy:
         return {
             "asset":            self.asset,
             "position_open":    pos.is_open,
-            "strike":           pos.strike,
-            "dte_h":            pos.dte_hours() if pos.is_open else 0,
+            "n_legs":           len(pos.legs),
+            "strike":           primary.strike if primary else 0.0,
+            "dte_h":            primary.dte_hours() if primary else 0.0,
             "notional_usd":     pos.notional_usd,
             "vol_premium":      premium,
             "rv":               rv,
@@ -597,6 +653,7 @@ class GammaScalpStrategy:
             "k_mle":            self.pricer.k_current,
             "fills_tracked":    len(self._trade_intervals),
             "ofi":              self.state.ofi(),
+            "accumulated_delta": self.state.delta_tracker.accumulated_delta,
         }
 
 
