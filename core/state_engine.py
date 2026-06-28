@@ -1151,8 +1151,12 @@ class StateEngine:
 
         try:
             spot = self.index.price()
-            # keep forward updated for SVI calibration
-            self.vol_surface.update_forward(expiry_ts, spot)
+            # correct forward: F = S * exp(r * T) where r = annualized funding
+            # at 5% ann funding, 7 DTE: e^(0.05 * 7/365) - 1 ≈ 0.1% bias without this
+            T_years = max(0.0, (expiry_ts - time.time()) / (365 * 24 * 3600))
+            funding_ann = self.funding.rate_ann if self.funding.rate_ann != 0.0 else 0.0
+            forward = spot * math.exp(funding_ann * T_years)
+            self.vol_surface.update_forward(expiry_ts, forward)
             rv = self.rv_estimator.rv_primary()
             self.vol_premium.update(iv, rv)
         except StateError:
