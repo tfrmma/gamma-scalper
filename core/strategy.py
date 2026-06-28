@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
@@ -256,22 +257,15 @@ class RollDetector:
 # ---- hedge calculator -------------------------------------------------------
 
 def compute_hedge(
-    state:      StateEngine,
-    asset:      str,
-    cfg:        Config,
+    state:    StateEngine,
+    asset:    str,
+    cfg:      Config,
+    calendar: "CalendarHedgeSelector | None" = None,
 ) -> HedgeOrder | None:
     """
-    Computes the perp hedge needed to flatten delta.
-
-    Uses delta_tracker.accumulated_delta, NOT inventory.net_delta.
-    inventory.net_delta only updates on fills — it's the delta at entry,
-    which for an ATM straddle is ~0 and stays 0 forever between fills.
-    accumulated_delta tracks the actual drift: gamma * dS on every tick.
-
-    Sign convention:
-      accumulated_delta > 0 means we've drifted long delta (spot moved up,
-      calls gained more delta than puts lost). Sell perp to flatten.
-      accumulated_delta < 0: spot moved down, drifted short. Buy perp.
+    Computes the perp (or calendar future) hedge to flatten accumulated delta.
+    Uses accumulated_delta from tracker, not inventory.net_delta.
+    Hedge instrument chosen by CalendarHedgeSelector based on funding regime.
     """
     if not state.needs_hedge():
         return None
@@ -279,21 +273,137 @@ def compute_hedge(
     accumulated  = state.delta_tracker.accumulated_delta
     spot         = state.spot()
     contract_sz  = cfg.market.assets[asset].contract_size
-
-    # accumulated is in option delta units, convert to USD notional
     notional_usd = abs(accumulated) * spot * contract_sz
 
     if notional_usd < cfg.market.assets[asset].min_trade_amount_perp:
         return None
 
-    side = "sell" if accumulated > 0 else "buy"
+    side       = "sell" if accumulated > 0 else "buy"
+    instrument = cfg.market.assets[asset].perp_instrument
+    if calendar is not None:
+        instrument = calendar.hedge_instrument(state)
 
     return HedgeOrder(
-        instrument   = cfg.market.assets[asset].perp_instrument,
+        instrument   = instrument,
         side         = side,
         notional_usd = notional_usd,
-        reason       = f"accumulated_delta={accumulated:.4f} spot={spot:.0f}",
+        reason       = f"accumulated_delta={accumulated:.4f} spot={spot:.0f} via={instrument}",
     )
+
+
+# ---- rolling Sharpe filter --------------------------------------------------
+
+class RollingSharpFilter:
+    """
+    Gate entries when the rolling Sharpe of vol premium is too low.
+    Prevents entering in periods where the premium has been erratic or negative
+    even if the current snapshot looks ok.
+
+    Sharpe computed over vol_premium_signal observations (not fills).
+    window_h controls how far back we look.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        sf = cfg.strategy.sharpe_filter
+        self._enabled   = sf.enabled
+        self._window_h  = sf.window_h
+        self._min_sharpe = sf.min_sharpe
+        self._min_obs   = sf.min_observations
+        self._history: deque[tuple[float, float]] = deque(maxlen=self._window_h)
+
+    def update(self, premium: float) -> None:
+        self._history.append((time.monotonic(), premium))
+
+    def passes(self) -> tuple[bool, str]:
+        if not self._enabled:
+            return True, ""
+        if len(self._history) < self._min_obs:
+            return True, ""   # not enough data yet, don't block
+
+        premiums = [p for _, p in self._history]
+        mean     = sum(premiums) / len(premiums)
+        if len(premiums) < 2:
+            return True, ""
+        std = math.sqrt(sum((p - mean)**2 for p in premiums) / (len(premiums) - 1))
+        if std < 1e-8:
+            return True, ""
+        sharpe = mean / std * math.sqrt(8760 / max(1, self._window_h))
+
+        if sharpe < self._min_sharpe:
+            return False, f"rolling Sharpe {sharpe:.2f} < min {self._min_sharpe}"
+        return True, ""
+
+
+# ---- calendar hedge selector ------------------------------------------------
+
+class CalendarHedgeSelector:
+    """
+    Decides whether to hedge delta with the perp or with a quarterly future.
+
+    When funding is persistently negative, short perp = paying funding = cost.
+    A quarterly future hedges the same delta without funding exposure.
+    The tradeoff: basis risk (futures trade at a premium/discount vs spot).
+
+    Switch logic:
+      - funding_ann < switch_threshold for >= confirmation_h hours -> use calendar
+      - otherwise -> use perp
+
+    The actual futures instrument name (e.g. BTC-27DEC24) is resolved at runtime
+    from the vol surface expiries — we pick the one closest to target_expiry_days.
+    Falls back to perp if no suitable quarterly found.
+    """
+
+    def __init__(self, cfg: Config, asset: str) -> None:
+        ch = cfg.strategy.calendar_hedge
+        self._enabled       = ch.enabled
+        self._threshold     = ch.switch_funding_threshold
+        self._confirm_h     = ch.switch_confirmation_h
+        self._target_days   = ch.target_expiry_days
+        self._max_basis     = ch.max_basis_pct
+        self._perp          = cfg.market.assets[asset].perp_instrument
+        self._asset         = asset
+        self._below_since_ms: int = 0
+
+    def hedge_instrument(self, state: StateEngine) -> str:
+        """Returns the instrument to use for delta hedging this tick."""
+        if not self._enabled:
+            return self._perp
+
+        funding_ann = state.funding.rate_ann
+        now_ms      = _now_ms()
+
+        if funding_ann < self._threshold:
+            if self._below_since_ms == 0:
+                self._below_since_ms = now_ms
+            elapsed_h = (now_ms - self._below_since_ms) / 3_600_000
+            if elapsed_h >= self._confirm_h:
+                quarterly = self._find_quarterly(state)
+                if quarterly:
+                    return quarterly
+        else:
+            self._below_since_ms = 0
+
+        return self._perp
+
+    def _find_quarterly(self, state: StateEngine) -> str | None:
+        """
+        Find nearest quarterly future expiry from the vol surface.
+        Quarterly expiries are the last Friday of Mar/Jun/Sep/Dec.
+        We approximate: any expiry >= target_expiry_days from now counts.
+        """
+        now_ts      = int(time.time())
+        target_s    = self._target_days * 86_400
+        expiries    = state.vol_surface.expiries()
+        candidates  = [e for e in expiries if (e - now_ts) >= target_s]
+        if not candidates:
+            return None
+        nearest = min(candidates)
+        # format: BTC-DDMMMYY (e.g. BTC-27DEC24)
+        import datetime
+        dt   = datetime.datetime.fromtimestamp(nearest, tz=datetime.timezone.utc)
+        name = f"{self._asset}-{dt.day:02d}{dt.strftime('%b').upper()}{dt.strftime('%y')}"
+        log.info(f"calendar hedge: switching to {name} (funding={state.funding.rate_ann:.1%} ann)")
+        return name
 
 
 # ---- main strategy ----------------------------------------------------------
@@ -400,19 +510,22 @@ class GammaScalpStrategy:
         self.state = state
         self.asset = asset
 
-        self.pricer   = ASPricer(cfg)
-        self.sizer    = Sizer(cfg, asset)
-        self.roller   = RollDetector(cfg)
-        self.position = PositionState()
+        self.pricer          = ASPricer(cfg)
+        self.sizer           = Sizer(cfg, asset)
+        self.roller          = RollDetector(cfg)
+        self.position        = PositionState()
+        self.sharpe_filter   = RollingSharpFilter(cfg)
+        self.calendar_hedge  = CalendarHedgeSelector(cfg, asset)
 
         self._vps     = cfg.strategy.vol_premium_signal
+        self._leg_cfg = cfg.strategy.leg[asset]
         self._trade_intervals: list[float] = []
         self._last_fill_time:  float       = 0.0
-        self._neg_edge_since_ms: int       = 0   # wall clock, not tick accumulator
+        self._neg_edge_since_ms: int       = 0
         self._last_signal_ms:    int       = 0
-        self._ofi_entry_threshold: float   = 0.60
+        self._ofi_entry_threshold: float   = cfg.strategy.ofi.entry_threshold
 
-        log.info(f"strategy ready | asset={asset} mode={cfg.strategy.strategy.mode}")
+        log.info(f"strategy ready | asset={asset} mode={cfg.strategy.strategy.mode} structure={self._leg_cfg.structure}")
 
     def on_fill(self, fill_time: float | None = None) -> None:
         """Call after any option fill to track arrival rate for k calibration."""
@@ -484,25 +597,28 @@ class GammaScalpStrategy:
         if not state.signal_enter():
             return self._hold("premium below entry threshold")
 
-        # OFI filter: don't enter into strong directional flow.
-        # If perp book shows heavy one-sided pressure, the move is likely to
-        # continue - our short gamma delta hedge will be chasing.
-        # Threshold: |OFI| > 0.6 means 80%+ of recent flow is one-sided.
         ofi = state.ofi()
         if abs(ofi) > self._ofi_entry_threshold:
             return self._hold(f"OFI filter: {ofi:+.2f} (directional flow, skip)")
+
+        # Sharpe filter: don't enter if premium regime is unstable
+        ok, reason = self.sharpe_filter.passes()
+        if not ok:
+            return self._hold(f"Sharpe filter: {reason}")
 
         spot    = state.spot()
         rv      = state.rv()
         premium = state.vol_premium.premium()
         mult    = state.size_multiplier()
 
+        # update Sharpe filter history on every entry check
+        self.sharpe_filter.update(premium)
+
         target = self.sizer.target_notional(
             vol_premium     = premium,
             size_multiplier = mult,
             entry_threshold = self._vps.entry_threshold,
         )
-
         if target <= 0:
             return self._hold("sizer returned 0")
 
@@ -510,18 +626,27 @@ class GammaScalpStrategy:
             return self._hold("vol surface empty, waiting for greeks")
 
         try:
-            expiry_ts = self._nearest_expiry()
-            iv        = state.atm_iv(expiry_ts)
-            dte_h     = _dte_hours(expiry_ts)
-            inventory = state.inventory.net_vega
-            # SABR vanna for skew-aware spread adjustment
+            expiry_ts  = self._nearest_expiry()
+            dte_h      = _dte_hours(expiry_ts)
+            inventory  = state.inventory.net_vega
             atm_strike = round(spot / 1000) * 1000
             vanna      = state.sabr_vanna(expiry_ts, atm_strike)
+            iv_atm     = state.atm_iv(expiry_ts)
+
+            # build quote(s) depending on structure
+            if self._leg_cfg.structure == "strangle":
+                call_iv = state.skew_at_delta(expiry_ts, self._leg_cfg.strangle_call_delta, is_call=True)
+                put_iv  = state.skew_at_delta(expiry_ts, self._leg_cfg.strangle_put_delta, is_call=False)
+                # quote using average of wing IVs as mid_vol
+                mid_vol = (call_iv + put_iv) / 2.0
+            else:
+                mid_vol = iv_atm
+
         except StateError as e:
             return self._hold(f"quote inputs missing: {e}")
 
         quote = self.pricer.quote(
-            mid_vol   = iv,
+            mid_vol   = mid_vol,
             rv        = rv,
             dte_hours = dte_h,
             inventory = inventory,
@@ -530,19 +655,20 @@ class GammaScalpStrategy:
         )
 
         regime = state.funding_regime()
+        hedge_instr = self.calendar_hedge.hedge_instrument(state)
         log.info(
-            f"ENTER signal | premium={premium:.1%} rv={rv:.1%} iv={iv:.1%} "
+            f"ENTER | premium={premium:.1%} rv={rv:.1%} iv={mid_vol:.1%} "
             f"notional=${target:,.0f} regime={regime.name} "
-            f"spread={quote.spread_vol:.2f}vp ofi={ofi:+.2f} "
-            f"vanna={vanna:.4f} sabr={'yes' if state.has_sabr(expiry_ts) else 'no'}"
+            f"structure={self._leg_cfg.structure} hedge={hedge_instr} "
+            f"ofi={ofi:+.2f} vanna={vanna:.4f}"
         )
 
         return StrategySignal(
-            action               = StrategyAction.ENTER,
-            asset                = self.asset,
-            quote                = quote,
-            target_notional_usd  = target,
-            reason               = f"premium={premium:.1%} mult={mult:.1f} ofi={ofi:+.2f}",
+            action              = StrategyAction.ENTER,
+            asset               = self.asset,
+            quote               = quote,
+            target_notional_usd = target,
+            reason              = f"premium={premium:.1%} mult={mult:.1f} ofi={ofi:+.2f}",
         )
 
     def _manage_position(self) -> StrategySignal:
@@ -583,7 +709,7 @@ class GammaScalpStrategy:
                 reason = roll_reason,
             )
 
-        hedge = compute_hedge(state, self.asset, self.cfg)
+        hedge = compute_hedge(state, self.asset, self.cfg, self.calendar_hedge)
         if hedge is not None:
             return StrategySignal(
                 action = StrategyAction.HEDGE,
@@ -660,20 +786,22 @@ class GammaScalpStrategy:
             premium = mult = rv = float("nan")
 
         return {
-            "asset":            self.asset,
-            "position_open":    pos.is_open,
-            "n_legs":           len(pos.legs),
-            "strike":           primary.strike if primary else 0.0,
-            "dte_h":            primary.dte_hours() if primary else 0.0,
-            "notional_usd":     pos.notional_usd,
-            "vol_premium":      premium,
-            "rv":               rv,
-            "size_mult":        mult,
-            "neg_edge_h":       self._neg_edge_hours(),
-            "k_mle":            self.pricer.k_current,
-            "fills_tracked":    len(self._trade_intervals),
-            "ofi":              self.state.ofi(),
+            "asset":             self.asset,
+            "structure":         self._leg_cfg.structure,
+            "position_open":     pos.is_open,
+            "n_legs":            len(pos.legs),
+            "strike":            primary.strike if primary else 0.0,
+            "dte_h":             primary.dte_hours() if primary else 0.0,
+            "notional_usd":      pos.notional_usd,
+            "vol_premium":       premium,
+            "rv":                rv,
+            "size_mult":         mult,
+            "neg_edge_h":        self._neg_edge_hours(),
+            "k_mle":             self.pricer.k_current,
+            "fills_tracked":     len(self._trade_intervals),
+            "ofi":               self.state.ofi(),
             "accumulated_delta": self.state.delta_tracker.accumulated_delta,
+            "hedge_instrument":  self.calendar_hedge.hedge_instrument(self.state),
         }
 
 
