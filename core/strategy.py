@@ -138,9 +138,21 @@ class ASPricer:
 
     def recalibrate_k(self, trade_intervals: list[float]) -> None:
         """
-        MLE for Poisson arrival rate: lambda_hat = n / sum(intervals).
-        Exact MLE for exponential inter-arrivals (Poisson process).
-        Blended with prior to avoid cold-start instability.
+        Bayesian update of Poisson arrival rate k.
+
+        Likelihood: inter-arrivals ~ Exponential(k)
+        Prior:      k ~ Gamma(alpha_0, beta_0)  (conjugate prior)
+        Posterior:  k ~ Gamma(alpha_0 + n, beta_0 + sum(intervals))
+
+        Posterior mean = (alpha_0 + n) / (beta_0 + sum(intervals))
+
+        With few trades (n << alpha_0) the prior dominates.
+        With many trades (n >> alpha_0) the MLE dominates.
+        This correctly handles thin weekends without the ad-hoc decay factor.
+
+        Prior calibration: alpha_0=5, beta_0=3.33 gives prior mean k=1.5
+        which matches k_prior from config. At n=50 trades the posterior
+        is ~90% driven by data.
         """
         if not trade_intervals:
             return
@@ -149,18 +161,21 @@ class ASPricer:
         if total_time <= 0:
             return
 
-        k_mle = n / total_time   # exact Poisson MLE
+        # Gamma conjugate prior: E[k] = alpha/beta = k_prior
+        # set beta_0 = alpha_0 / k_prior so prior mean = k_prior
+        alpha_0 = 5.0
+        beta_0  = alpha_0 / self.k_prior
 
-        # blend with prior: more weight on MLE as we get more data
-        # after 200 trades, prior weight ~= 0.1 * (1/2)^(n/50) ~ negligible
-        prior_weight = self._k_decay * math.exp(-n / 50.0)
-        self._k_mle  = (1 - prior_weight) * k_mle + prior_weight * self.k_prior
-
+        # posterior mean
+        self._k_mle          = (alpha_0 + n) / (beta_0 + total_time)
         self._last_calibration = time.monotonic()
         self._n_calibrations  += 1
+
+        posterior_weight = n / (alpha_0 + n)
         log.info(
-            f"k recalibrated (MLE) | k_mle={k_mle:.4f} k_blended={self._k_mle:.4f} "
-            f"n={n} total_time={total_time:.1f}s calibration={self._n_calibrations}"
+            f"k recalibrated (Bayes) | k={self._k_mle:.4f} "
+            f"n={n} data_weight={posterior_weight:.0%} "
+            f"calibration={self._n_calibrations}"
         )
 
     @property
@@ -393,11 +408,8 @@ class GammaScalpStrategy:
         self._vps     = cfg.strategy.vol_premium_signal
         self._trade_intervals: list[float] = []
         self._last_fill_time:  float       = 0.0
-        self._consecutive_neg_h: float     = 0.0
+        self._neg_edge_since_ms: int       = 0   # wall clock, not tick accumulator
         self._last_signal_ms:    int       = 0
-        # OFI threshold: skip entry when perp flow is too one-sided
-        # 0.6 = 80%+ of recent ticks weighted one direction
-        # tune this in live - too tight and you miss entries, too loose and you get run over
         self._ofi_entry_threshold: float   = 0.60
 
         log.info(f"strategy ready | asset={asset} mode={cfg.strategy.strategy.mode}")
@@ -452,14 +464,13 @@ class GammaScalpStrategy:
 
         self._track_negative_premium(is_emergency=False)
 
-        # extended negative premium - reduce before it gets worse
-        if self._consecutive_neg_h >= self.cfg.risk.kill_switch.premium_negative_consecutive_h:
+        if self._neg_edge_hours() >= self.cfg.risk.kill_switch.premium_negative_consecutive_h:
             if self.position.is_open:
                 return StrategySignal(
                     action = StrategyAction.REDUCE,
                     asset  = self.asset,
                     target_notional_usd = self.position.notional_usd * 0.30,
-                    reason = f"premium negative for {self._consecutive_neg_h:.0f}h",
+                    reason = f"premium negative for {self._neg_edge_hours():.1f}h",
                 )
 
         if self.position.is_open:
@@ -584,7 +595,11 @@ class GammaScalpStrategy:
         return self._hold("position ok, no action")
 
     def _track_negative_premium(self, is_emergency: bool) -> None:
-        """Track how long the adjusted edge has been negative. Used for reduce trigger."""
+        """
+        Track how long adjusted edge has been negative.
+        Uses wall clock (monotonic ms), not tick accumulation.
+        Changing tick_interval_s in main no longer affects this trigger.
+        """
         try:
             premium = self.state.vol_premium.premium()
             funding = self.state.funding.rate_ann
@@ -592,13 +607,18 @@ class GammaScalpStrategy:
         except StateError:
             return
 
-        tick_interval_h = (_now_ms() - self._last_signal_ms) / 3_600_000 if self._last_signal_ms else 0
-        self._last_signal_ms = _now_ms()
-
+        now_ms = _now_ms()
         if adj < 0 or is_emergency:
-            self._consecutive_neg_h += tick_interval_h
+            if self._neg_edge_since_ms == 0:
+                self._neg_edge_since_ms = now_ms
         else:
-            self._consecutive_neg_h = 0.0
+            self._neg_edge_since_ms = 0
+
+    def _neg_edge_hours(self) -> float:
+        """How long adjusted edge has been continuously negative, in hours."""
+        if self._neg_edge_since_ms == 0:
+            return 0.0
+        return (_now_ms() - self._neg_edge_since_ms) / 3_600_000
 
     def _nearest_expiry(self) -> int:
         """
@@ -649,7 +669,7 @@ class GammaScalpStrategy:
             "vol_premium":      premium,
             "rv":               rv,
             "size_mult":        mult,
-            "neg_edge_h":       self._consecutive_neg_h,
+            "neg_edge_h":       self._neg_edge_hours(),
             "k_mle":            self.pricer.k_current,
             "fills_tracked":    len(self._trade_intervals),
             "ofi":              self.state.ofi(),
