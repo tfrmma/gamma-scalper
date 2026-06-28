@@ -64,14 +64,32 @@ class AssetSystem:
                                     on_halt=self._on_halt)
         self.strategy  = GammaScalpStrategy(cfg, self.state, asset)
 
-    async def _on_fill(self, exchange_id: str, size: float, price: float, greek: float) -> None:
-        log.info(f"fill | {self.asset} | eid={exchange_id} size={size} px={price:.2f}")
+    async def _on_fill(self, exchange_id: str, size: float, price: float, iv: float) -> None:
+        log.info(f"fill | {self.asset} | eid={exchange_id} size={size} px={price:.4f} iv={iv:.2%}")
         self.strategy.on_fill()
-        self.risk.record_pnl_tick(0.0)   # TODO: compute real PnL from fill + greeks
+
+        # determine instrument and side from live orders in execution engine
+        # fall back to "unknown" if already removed from live_orders (filled + cleaned up)
+        instrument = "unknown"
+        side       = "buy"
+        for order in self.execution._live_orders.values():
+            if order.exchange_id == exchange_id:
+                instrument = order.instrument
+                side       = order.side
+                break
+
+        # real PnL computed from fill price vs entry price
+        self.risk.on_fill(
+            instrument = instrument,
+            fill_price = price,
+            fill_size  = size,
+            side       = side,
+            fee_usd    = price * size * self.cfg.market.fees[self.asset].option_taker_fee,
+        )
 
     async def _on_halt(self, reason: KillReason, detail: str) -> None:
         log.error(f"HALT | {self.asset} | {reason.name} | {detail}")
-        # TODO: wire up alerting here (telegram, pagerduty, etc.)
+        # alerter is inside risk engine - this callback is for any extra app-level logic
 
 
 # ---- loops ------------------------------------------------------------------
