@@ -94,6 +94,8 @@ class LegConfig(BaseModel):
     base_notional_usd:  float
     max_notional_usd:   float
     min_notional_usd:   float
+    strangle_call_delta: float = 0.25
+    strangle_put_delta:  float = 0.25
 
     @model_validator(mode="after")
     def check_notional_bounds(self) -> "LegConfig":
@@ -177,13 +179,35 @@ class RollingConfig(BaseModel):
     roll_max_slippage_pct:         float
 
 
+class OfiConfig(BaseModel):
+    entry_threshold: float = Field(ge=0.0, le=1.0)
+
+
+class SharpeFilterConfig(BaseModel):
+    enabled:          bool
+    window_h:         int
+    min_sharpe:       float
+    min_observations: int
+
+
+class CalendarHedgeConfig(BaseModel):
+    enabled:                   bool
+    switch_funding_threshold:  float
+    switch_confirmation_h:     int
+    target_expiry_days:        int
+    max_basis_pct:             float
+
+
 class StrategyConfig(BaseModel):
     strategy:           _StrategyMeta
     leg:                dict[str, LegConfig]
     avellaneda_stoikov: AvellanedaStoikovConfig
     realized_vol:       RealizedVolConfig
     vol_premium_signal: VolPremiumSignalConfig
+    sharpe_filter:      SharpeFilterConfig
+    ofi:                OfiConfig
     funding_regime:     FundingRegimeConfig
+    calendar_hedge:     CalendarHedgeConfig
     delta_hedge:        DeltaHedgeConfig
     rolling:            RollingConfig
 
